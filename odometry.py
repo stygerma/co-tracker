@@ -12,6 +12,7 @@ from matplotlib.axes import Axes
 from matplotlib.collections import PathCollection
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
+from mpl_toolkits.mplot3d.axes3d import Axes3D
 from numpy import typing as npt
 from scipy.spatial.transform import Rotation as R
 from sips.data import CameraPose
@@ -71,36 +72,43 @@ class Odometry:
             height, width = self.config.image_shape
             true_keypoint_angles = self.config.true_keypoint_angles
             true_keypoint_distances = self.config.true_keypoint_distances
+            true_keypoint_starting_frames = self.config.true_keypoint_starting_frames
 
-            assert len(true_keypoint_angles) == len(true_keypoint_distances)
+            assert len(true_keypoint_angles) == len(true_keypoint_distances) and len(
+                true_keypoint_distances
+            ) == len(true_keypoint_starting_frames)
             true_keypoints: npt.NDArray[np.float64] = np.full(
                 (self.config.num_frames, len(true_keypoint_angles), 2), np.nan
             )
             angle_range = self.config.angular_fov // 2
-            center = (width // 2, 0)  # Sonar origin at the top center
+            origin = (width // 2, 0)  # Sonar origin at the top center
 
             for frame_num in range(self.config.num_frames):
-                for track_num, (angle, distance) in enumerate(
-                    zip(true_keypoint_angles, true_keypoint_distances)
+                for track_num, (angle, distance, starting_frame) in enumerate(
+                    zip(
+                        true_keypoint_angles,
+                        true_keypoint_distances,
+                        true_keypoint_starting_frames,
+                    )
                 ):
+                    if starting_frame > frame_num:
+                        continue
                     angle = angle + frame_num * self.config.angular_step_size
 
                     # Check if the angle is within the range
-                    if -angle_range >= angle >= angle_range:
-                        # true_keypoints[frame_num].append([float("nan"), float("nan")])
+                    if -angle_range >= angle or angle >= angle_range:
                         continue
 
                     # Check if the distance is within the image bounds
-                    if 0 > distance > height:
-                        # true_keypoints[frame_num].append([float("nan"), float("nan")])
+                    if 0 > distance or distance > height:
                         continue
 
                     # Convert angle to radians
                     angle_rad = np.radians(angle)
 
                     # Convert polar to Cartesian coordinates
-                    x = center[0] + distance * np.sin(angle_rad)
-                    y = center[1] + distance * np.cos(angle_rad)
+                    x = origin[0] + distance * np.sin(angle_rad)
+                    y = origin[1] + distance * np.cos(angle_rad)
 
                     true_keypoints[frame_num, track_num] = [x, y]
                     continue
@@ -115,7 +123,12 @@ class Odometry:
         true_keypoints = np.full(
             (self.config.num_frames, len(manual_keypoints), 2), np.nan
         )
-        true_keypoints[0] = manual_keypoints
+        true_keypoints[
+            manual_keypoints[:, 0].astype(np.int8),
+            np.linspace(
+                0, self.config.num_tracks - 1, self.config.num_tracks, dtype=np.int8
+            ),
+        ] = manual_keypoints[:, 1:]
         return true_keypoints
 
     def get_source_video(self) -> npt.NDArray[np.uint8]:
@@ -191,7 +204,7 @@ class Odometry:
         # Create a black background
         image = np.zeros((height, width), dtype=np.uint8)
         # Define sonar parameters
-        center = (width // 2, 0)  # Sonar origin at the top center
+        origin = (width // 2, 0)  # Sonar origin at the top center
         radius = height  # Frustum should reach the bottom
 
         # Compute the required opening angle to span the full width
@@ -201,15 +214,15 @@ class Odometry:
         mask = np.zeros((height, width), dtype=np.uint8)
 
         # Define sector points manually to ensure correct positioning
-        num_points = 500  # More points for a smooth arc
+        num_points = width  # More points for a smooth arc
         angles = np.linspace(
             -np.radians(angle_range / 2), np.radians(angle_range / 2), num_points
         )
-        x = (radius * np.sin(angles) + center[0]).astype(np.int32)
+        x = (radius * np.sin(angles) + origin[0]).astype(np.int32)
         y = (radius * np.cos(angles)).astype(np.int32)
 
         # Create the frustum polygon (sector shape)
-        points = np.vstack((np.append(center[0], x), np.append(center[1], y))).T
+        points = np.vstack((np.append(origin[0], x), np.append(origin[1], y))).T
         cv2.fillPoly(mask, [points.astype(np.int32)], (255,))
 
         # Apply the mask to the sonar frustum
@@ -231,6 +244,43 @@ class Odometry:
     # --------------------------------------------------------------------------
     # Track the "true" keypoints with co-tracker
 
+    def _keypoints_to_cotrack_format(
+        self,
+        keypoints: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert keypoints to the format expected by the co-tracker model.
+
+        Args:
+            keypoints (torch.Tensor): (num_frames, num_tracks, 2)
+
+        Returns:
+            torch.Tensor: (1, num_tracks, 3)
+        """  #
+        assert keypoints.shape == (self.config.num_frames, self.config.num_tracks, 2)
+        assert (keypoints[..., 0].isnan() == keypoints[..., 1].isnan()).all()
+        # Minimum track number where the keypoints for each track are not NaN
+        keypoints_first_frame_num = torch.argmax(
+            ~torch.isnan(keypoints)[..., 0].int(), dim=0
+        )
+
+        # Combine the first non-NaN keypoint and the frame number for each track
+        true_keypoints = torch.cat(
+            [
+                keypoints_first_frame_num[:, None],
+                keypoints[
+                    keypoints_first_frame_num,
+                    torch.linspace(
+                        0, self.config.num_tracks - 1, self.config.num_tracks
+                    ).int(),
+                ],
+            ],
+            dim=1,
+        )[None]
+
+        assert true_keypoints.shape == (1, self.config.num_tracks, 3)
+        return true_keypoints
+
     def _compute_cotrack_keypoints(self) -> None:
         default_device = self.config.default_device
         if default_device == "cuda":
@@ -248,14 +298,16 @@ class Odometry:
         # The cotracker model expects the queries to have shape (B, num_tracks, 2)
         # with the batch number B being 1 for our case and the last dimension consisting
         # of the frame number and the x and y coordinates of the keypoints.
-        true_keypoints = true_keypoints[0][None]
-        true_keypoints = torch.cat(
-            (
-                torch.zeros(1, true_keypoints.shape[1], 1).to(default_device),
-                true_keypoints,
-            ),
-            dim=2,
-        )
+
+        true_keypoints = self._keypoints_to_cotrack_format(true_keypoints)
+        # true_keypoints = true_keypoints[0][None]
+        # true_keypoints = torch.cat(
+        #     (
+        #         torch.zeros(1, true_keypoints.shape[1], 1).to(default_device),
+        #         true_keypoints,
+        #     ),
+        #     dim=2,
+        # )
 
         assert (
             true_keypoints.ndim == 3
@@ -265,7 +317,10 @@ class Odometry:
 
         if self.config.offline_model:
             pred_keypoints, pred_visibilities = model(
-                source_video, queries=true_keypoints, backward_tracking=True
+                source_video,
+                queries=true_keypoints,
+                # grid_size=10,
+                backward_tracking=self.config.offline_model_backward_tracking,
             )
         else:
             model(
@@ -283,6 +338,39 @@ class Odometry:
         if default_device == "cuda":
             torch.cuda.empty_cache()
 
+    def _compare_models(self) -> None:
+        import pandas as pd
+
+        # if not self.config.check_visibilities:
+        mse = np.nanmean((self.true_keypoints - self.pred_keypoints) ** 2)
+        # else:
+        #     mse = np.nanmean((self.true_keypoints - self._apply_visibilities()) ** 2)
+        df = pd.DataFrame(
+            [
+                [
+                    self.config.offline_model,
+                    self.config.offline_model_backward_tracking,
+                    self.config.subpixel_accuracy,
+                    self.config.add_sonar_noise,
+                    # self.config.check_visibilities,
+                    # self.config.needed_visibility_ratio,
+                    mse,
+                ]
+            ],
+            columns=[
+                "offline_model",
+                "offline_model_backward_tracking",
+                "subpixel_accuracy",
+                "add_sonar_noise",
+                # "check_visibilities",
+                # "needed_visibility_ratio",
+                "MSE",
+            ],
+        )
+        df.to_csv(
+            "co-tracker/synt_data_comparison.csv", mode="a", index=False, header=False
+        )
+
     def cotrack_keypoints(self) -> None:
         print("Tracking keypoints with co-tracker")
 
@@ -294,6 +382,8 @@ class Odometry:
             self._compute_cotrack_keypoints()
 
         print("Finished keypoint tracking")
+        if self.config.compare_cotracker_models:
+            _compare_models()
         return
 
     # --------------------------------------------------------------------------
@@ -420,13 +510,17 @@ class Odometry:
                 return np.degrees(yaws)
             return yaws
 
-    def plot_keypoint_trajectories(self, display_track_numbers: bool = False) -> Axes:
+    def plot_keypoint_trajectories(self, display_track_numbers: bool = True) -> Axes:
         height, width = self.config.image_shape
         _, ax = plt.subplots()
         ax.set_xlim(0, width)
         ax.set_ylim(0, height)
         ax.invert_yaxis()
         origin = np.array([width // 2, 0])
+
+        num_tracks = self.config.num_tracks
+        colors = self.colormap(np.linspace(0, 1, num_tracks + 2))
+        label_for_empty_points_is_set = False
 
         # Store easy labels for the legend
         all_labels: list[Line2D | PathCollection] = []
@@ -435,16 +529,63 @@ class Odometry:
         all_labels.append(
             ax.axvline(
                 x=origin[0],
-                color="black",
+                color="gray",
                 linestyle="--",
                 label="Sonar center",
                 alpha=0.5,
             )
         )
 
-        num_tracks = self.config.num_tracks
-        colors = self.colormap(np.linspace(0, 1, num_tracks + 2))
-        label_for_empty_points_is_set = False
+        # Define sector points manually to ensure correct positioning
+        angle_range = self.config.angular_fov
+        radius = height
+        num_points = width  # More points for a smooth arc
+        frustum_angles = np.linspace(
+            -np.radians(angle_range / 2), np.radians(angle_range / 2), num_points
+        )
+        frustum_x = (radius * np.sin(frustum_angles) + origin[0]).astype(np.int32)
+        frustum_y = (radius * np.cos(frustum_angles)).astype(np.int32)
+
+        frustum_x = np.append(np.insert(frustum_x, 0, origin[0]), origin[0])
+        frustum_y = np.append(np.insert(frustum_y, 0, origin[1]), origin[1])
+        all_labels.append(
+            ax.plot(
+                frustum_x,
+                frustum_y,
+                color="black",
+                linestyle="--",
+                label="Sonar frustum",
+                alpha=0.5,
+            )[0]
+        )
+
+        # Plot angle sectors
+        sector_angles = np.radians(
+            np.linspace(
+                -angle_range / 2,
+                angle_range / 2,
+                1 + angle_range // self.config.angular_step_size,
+            )
+        )
+        sector_x = (radius * np.sin(sector_angles) + origin[0]).astype(np.int32)
+        sector_y = (radius * np.cos(sector_angles)).astype(np.int32)
+        ax.plot(
+            [sector_x, np.full(len(sector_x), origin[0])],
+            [sector_y, np.full(len(sector_y), origin[1])],
+            color="gray",
+            linestyle="--",
+            alpha=0.5,
+        )
+
+        all_labels.append(
+            ax.scatter(
+                origin[0],
+                origin[1],
+                marker="^",
+                color=colors[num_tracks],
+                label="Sonar origin",
+            )
+        )
 
         for track in range(num_tracks):
             # Plot true tracks with solid lines
@@ -510,30 +651,27 @@ class Odometry:
                 linestyle="-",
                 color="red",
             )
-        all_labels.append(
-            ax.scatter(
-                origin[0],
-                origin[1],
-                marker="^",
-                color=colors[num_tracks],
-                label="Sonar origin",
-            )
-        )
 
+        first_existing_true_keypoint_per_frame = self._keypoints_to_cotrack_format(
+            torch.tensor(self.true_keypoints)
+        )[0]
         all_labels.append(
             ax.scatter(
-                self.true_keypoints[0, :, 0],
-                self.true_keypoints[0, :, 1],
+                first_existing_true_keypoint_per_frame[:, 1],
+                first_existing_true_keypoint_per_frame[:, 2],
                 marker=">",
                 color=colors[num_tracks + 1],
                 zorder=2,
-                label="True starting points",
+                label="True starting points of tracks",
             )
         )
 
         if display_track_numbers:
             for i, (x, y) in enumerate(
-                zip(self.true_keypoints[0, :, 0], self.true_keypoints[0, :, 1])
+                zip(
+                    first_existing_true_keypoint_per_frame[:, 1],
+                    first_existing_true_keypoint_per_frame[:, 2],
+                )
             ):
                 ax.text(x, y, str(i))
 
@@ -611,15 +749,17 @@ class Odometry:
             # to make the comparison easier. The offsets are chosen based on
             # default offsets of matplotlib.
             ax.set_xlim(-0.65, self.odometry_transforms.shape[1] - 0.35)
-            xs = ax.plot(
-                [self._xs(transform, meters=meters) for transform in transforms],
+            xs = [self._xs(transform, meters=meters) for transform in transforms]
+            xs_lns = ax.plot(
+                xs,
                 label="xs",
                 marker=".",
                 linestyle="-.",
                 c=colors[0],
             )
-            ys = ax.plot(
-                [self._ys(transform, meters=meters) for transform in transforms],
+            ys = [self._ys(transform, meters=meters) for transform in transforms]
+            ys_lns = ax.plot(
+                ys,
                 label="ys",
                 marker=".",
                 linestyle="--",
@@ -627,26 +767,26 @@ class Odometry:
             )
 
             ax_twin = ax.twinx()
-            yaws = ax_twin.plot(
+            yaws_lns = ax_twin.plot(
                 self._yaws(transforms, degrees=degrees),
                 marker=".",
                 linestyle="-",
                 label="yaws",
                 c=colors[2],
             )
+            # _scientif_notation_highlighter(ax, np.array(xs + ys))
             # The y-axis dimensions were displayed in unintuitve scientific notation
             # without this (1e-6-5) which this line fixes.
             ax_twin.get_yaxis().get_major_formatter().set_useOffset(False)
-
-            lns = xs + ys + yaws
+            lns = xs_lns + ys_lns + yaws_lns
             labs = [line.get_label() for line in lns]
             ax.legend(lns, labs)
             ax.xaxis.set_major_locator(MaxNLocator(integer=True, prune="both"))
             translation_ylabel = (
-                "Translation (meters)" if meters else "Translation (pixels)"
+                "Translation [meters]" if meters else "Translation [pixels]"
             )
             ax.set_ylabel(translation_ylabel)
-            rotation_ylabel = "Yaw (radians)" if not degrees else "Yaw (degrees)"
+            rotation_ylabel = "Yaw [radians]" if not degrees else "Yaw [degrees]"
             ax_twin.set_ylabel(rotation_ylabel, color=colors[2])
             ax_twin.tick_params(axis="y", labelcolor=colors[2])
             ax.set_title(
@@ -696,10 +836,10 @@ class Odometry:
             return self.config.init_pose[self.config.file_name]
         return self.config.init_pose["default"]
 
-    def plot_odometry_estimated_poses(self, meters: bool = True) -> list[Axes]:
+    def plot_odometry_estimated_poses(self, meters: bool = True) -> list[Axes3D]:
         axes: list[Axes] = []
         custom_cm = cm["gist_rainbow"]
-        colors = custom_cm(np.linspace(0, 1, self.odometry_transforms.shape[1]))
+        colors = custom_cm(np.linspace(0, 1, self.odometry_transforms.shape[1] + 1))
         for transforms, name in zip(
             [*self.odometry_transforms],
             ["co-tracker predicted", "true (synthetic)"],
@@ -718,6 +858,9 @@ class Odometry:
                 color="lime",
                 label="Origin",
             )
+            poses_ax.set_ylabel("y [meters]" if meters else "y [pixels]")
+            poses_ax.set_xlabel("x [meters]" if meters else "x [pixels]")
+            poses_ax.set_zlabel("z [meters]" if meters else "z [pixels]")
             axes.append(poses_ax)
             # Connect subsequent poses with lines
             for i in range(len(pose_tracker) - 1):
@@ -789,7 +932,7 @@ def main() -> None:
     odo = Odometry(config)
     odo.cotrack_keypoints()
     odo.estimate_odometry()
-    # odo.analyze_odometry()
+    odo.analyze_odometry()
     odo.save_data()
     return
 

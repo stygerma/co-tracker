@@ -29,9 +29,15 @@ class IO:
     ) -> str:
         file_name = self.config.file_name
         if with_model:
-            file_name = f"{self.config.model_name}_{file_name}"
+            if self.config.offline_model:
+                file_name = f"{self.config.model_name}_{self.config.offline_model_backward_tracking}_{file_name}"
+            else:
+                file_name = f"{self.config.model_name}_{file_name}"
         if with_visibility:
-            file_name = f"{file_name}_{self.config.check_visibilities}_{self.config.needed_visibility_ratio}"
+            if self.config.check_visibilities:
+                file_name = f"{file_name}_{self.config.check_visibilities}_{self.config.needed_visibility_ratio}"
+            else:
+                file_name = f"{file_name}_{self.config.check_visibilities}"
         return file_name
 
     def get_video_name(self, with_model: bool = False) -> str:
@@ -259,9 +265,9 @@ class IO:
     def store_odometry_inliers(self, inliers: npt.NDArray[np.uint8]) -> None:
         assert inliers.ndim == 3
         preds = [True, False]
-        for inliers, pred in zip(inliers, preds):
-            assert inliers.shape == (self.config.num_frames - 1, 6)
-            pd.DataFrame(inliers.reshape(-1, 6)).to_csv(
+        for inlier, pred in zip(inliers, preds):
+            assert inlier.shape == (self.config.num_frames - 1, self.config.num_tracks)
+            pd.DataFrame(inlier.reshape(-1, self.config.num_tracks)).to_csv(
                 self.get_odometry_inliers_path(pred=pred), index=False, header=False
             )
         return
