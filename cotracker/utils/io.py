@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import imageio
@@ -295,3 +296,18 @@ class IO:
             self.config.num_tracks,
         )
         return odometry_inliers
+
+    def load_true_poses(self) -> npt.NDArray[np.float64]:
+        if self.config.synthetic_data or self.config.file_name not in [
+            "sonarImageStructure",
+            "PolarSonarImageStructure",
+        ]:
+            raise ValueError(
+                "True poses are only available for the sonarImageStructure and PolarSonarImageStructure"
+            )
+        with open(
+            "co-tracker/data/source_data/poses/interpolated_sonarImageStructure.json"
+        ) as f:
+            true_poses_with_stamp = json.load(f)
+        true_poses = list(true_poses_with_stamp.values())
+        return np.array(true_poses)

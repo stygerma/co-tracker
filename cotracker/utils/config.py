@@ -9,20 +9,25 @@ from sips.data import CameraPose
 class Config:
     data_dir: str = "co-tracker/data"
 
-    image_shape: tuple[int, int] = (616, 1116)
+    image_shape: tuple[int, int] = (
+        522,
+        1024,
+    )  # height and width in cartesian coordinates
 
     angular_fov: int = 130
+    max_range: float = 5.0
     range_resolution: float = 0.009571
 
     file_name: str = "sonarImageStructure"
 
     rng = np.random.default_rng(42)
 
-    num_frames: int = 19
-    synthetic_data: bool = True
+    num_frames: int = 400
+    _num_tracks: int = field(repr=False, init=False)
+    synthetic_data: bool = False
     random_synthetic_data: bool = True
     num_synthetic_tracks: int = 100
-    offline_model: bool = True
+    offline_model: bool = False
     offline_model_backward_tracking: bool = False
     force_redo: bool = True
 
@@ -51,6 +56,10 @@ class Config:
         0.0  # 0.0 keeps all frames and only applies individual exclusion
     )
 
+    plot_all_datapoints: bool = False
+
+    brightness_threshold: int = 230
+
     # Manually selected keypoints for real data
     manual_keypoints: dict[str, npt.NDArray[np.float64]] = field(
         default_factory=lambda: {
@@ -63,6 +72,17 @@ class Config:
                     [0.0, 582.9, 191.5],
                     [0.0, 610.8, 175.1],
                     [4.0, 539.0, 405.1],
+                ]
+            ),
+            "PolarSonarImageStructure": np.array(
+                [
+                    [0.0, 204.0, 347.3],
+                    [0.0, 161.1, 180.0],
+                    [0.0, 250.8, 181.5],
+                    [0.0, 346.6, 410.8],
+                    [0.0, 337.5, 204.7],
+                    [0.0, 373.8, 202.0],
+                    [4.0, 271.3, 406.0],
                 ]
             ),
             "rerecordLimmatCartesian": np.array(
@@ -111,11 +131,21 @@ class Config:
                     0.8478520514853168,
                 ],
             ),
+            "PolarSonarImageStructure": CameraPose(  # raw data
+                [-4.9045622151498804, 2.577873106620971, -3.4396288313875956],
+                [
+                    -0.018066443533008323,
+                    0.003689051080770826,
+                    0.529912156222455,
+                    0.8478520514853168,
+                ],
+            ),
         }
     )
 
     def __post_init__(self) -> None:
         if self.synthetic_data:
+            self._num_tracks = len(self.true_keypoint_distances)
             self.file_name = "fake_sonar"
             if self.subpixel_accuracy:
                 self.file_name += "_subpixel"
@@ -131,12 +161,16 @@ class Config:
                     low=0, high=self.image_shape[0], size=self.num_synthetic_tracks
                 )
                 self.true_keypoint_starting_frames = np.zeros(self.num_synthetic_tracks)
+        else:
+            self._num_tracks = len(self.manual_keypoints[self.file_name])
 
     @property
     def num_tracks(self) -> int:
-        if self.synthetic_data:
-            return len(self.true_keypoint_distances)
-        return len(self.manual_keypoints[self.file_name])
+        return self._num_tracks
+
+    @num_tracks.setter
+    def num_tracks(self, value: int) -> None:
+        self._num_tracks = value
 
     @property
     def model_name(self) -> str:

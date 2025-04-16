@@ -3,12 +3,12 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+# type: ignore
 import torch
 import torch.nn.functional as F
 
-from cotracker.models.core.model_utils import smart_cat, get_points_on_a_grid
 from cotracker.models.build_cotracker import build_cotracker
+from cotracker.models.core.model_utils import get_points_on_a_grid, smart_cat
 
 
 class CoTrackerPredictor(torch.nn.Module):
@@ -75,7 +75,9 @@ class CoTrackerPredictor(torch.nn.Module):
         grid_width = W // grid_step
         grid_height = H // grid_step
         tracks = visibilities = None
-        grid_pts = torch.zeros((video.shape[0], grid_width * grid_height, 3)).to(video.device)
+        grid_pts = torch.zeros((video.shape[0], grid_width * grid_height, 3)).to(
+            video.device
+        )
         grid_pts[:, :, 0] = grid_query_frame
         for offset in range(grid_step * grid_step):
             print(f"step {offset} / {grid_step * grid_step}")
@@ -163,10 +165,10 @@ class CoTrackerPredictor(torch.nn.Module):
                 video, queries, tracks, visibilities
             )
             if add_support_grid:
-                queries[:, -self.support_grid_size**2 :, 0] = T - 1
+                queries[:, -(self.support_grid_size**2) :, 0] = T - 1
         if add_support_grid:
-            tracks = tracks[:, :, : -self.support_grid_size**2]
-            visibilities = visibilities[:, :, : -self.support_grid_size**2]
+            tracks = tracks[:, :, : -(self.support_grid_size**2)]
+            visibilities = visibilities[:, :, : -(self.support_grid_size**2)]
         thr = 0.9
         visibilities = visibilities > thr
 
@@ -246,32 +248,40 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 self.N = N
                 assert D == 3
                 queries = queries.clone()
-                queries[:, :, 1:] *= queries.new_tensor(
-                    [
-                        (self.interp_shape[1] - 1) / (W - 1),
-                        (self.interp_shape[0] - 1) / (H - 1),
-                    ]
-                )
+                queries = torch.full((queries.shape), torch.nan, device=queries.device)
                 if add_support_grid:
                     grid_pts = get_points_on_a_grid(
-                        self.support_grid_size, self.interp_shape, device=video_chunk.device
+                        self.support_grid_size,
+                        self.interp_shape,
+                        device=video_chunk.device,
                     )
                     grid_pts = torch.cat(
                         [torch.zeros_like(grid_pts[:, :, :1]), grid_pts], dim=2
                     )
                     queries = torch.cat([queries, grid_pts], dim=1)
             elif grid_size > 0:
-                grid_pts = get_points_on_a_grid(
-                    grid_size, self.interp_shape, device=video_chunk.device
-                )
-                self.N = grid_size**2
-                queries = torch.cat(
-                    [torch.ones_like(grid_pts[:, :, :1]) * grid_query_frame, grid_pts],
-                    dim=2,
-                )
-            
+                from warnings import warn
+
+                warn("grid_size is turned off for online processing.")
             self.queries = queries
             return (None, None)
+
+        if queries is not None:
+            assert 3 == queries.shape[-1]
+            queries = queries.clone()
+
+            # Scale the queries to the model resolution
+            queries[:, :, 1:] *= queries.new_tensor(
+                [
+                    (self.interp_shape[1] - 1) / (W - 1),
+                    (self.interp_shape[0] - 1) / (H - 1),
+                ]
+            )
+
+            if not hasattr(self, "queries") or self.queries is None:
+                self.queries = queries
+            else:
+                self.queries = torch.cat([self.queries, queries], dim=1)
 
         video_chunk = video_chunk.reshape(B * T, C, H, W)
         video_chunk = F.interpolate(
@@ -289,11 +299,10 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 video=video_chunk, queries=self.queries, iters=6, is_online=True
             )
         if add_support_grid:
-            tracks = tracks[:,:,:self.N]
-            visibilities = visibilities[:,:,:self.N]
+            tracks = tracks[:, :, : self.N]
+            visibilities = visibilities[:, :, : self.N]
             if not self.v2:
-                confidence = confidence[:,:,:self.N]
-            
+                confidence = confidence[:, :, : self.N]
         if not self.v2:
             visibilities = visibilities * confidence
         thr = 0.6

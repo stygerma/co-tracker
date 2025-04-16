@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+
 from cotracker.models.core.cotracker.cotracker3_online import CoTrackerThreeBase, posenc
 
 torch.manual_seed(0)
@@ -103,7 +103,6 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
 
         # We compute track features
         fmaps_pyramid = []
-        track_feat_pyramid = []
         track_feat_support_pyramid = []
         fmaps_pyramid.append(fmaps)
         for i in range(self.corr_levels - 1):
@@ -123,7 +122,6 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
                 queried_coords / 2**i,
                 support_radius=self.corr_radius,
             )
-            track_feat_pyramid.append(track_feat.repeat(1, T, 1, 1))
             track_feat_support_pyramid.append(track_feat_support.unsqueeze(1))
 
         D_coords = 2

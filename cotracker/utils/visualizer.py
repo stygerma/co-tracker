@@ -1,18 +1,19 @@
+# mypy: disable-error-code="no-untyped-def"
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
 import os
-import numpy as np
-import imageio
-import torch
 
-from matplotlib import cm
+import cv2
+import imageio
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
+from matplotlib import cm
 from PIL import Image, ImageDraw
 
 
@@ -68,7 +69,7 @@ class Visualizer:
         fps: int = 10,
         mode: str = "rainbow",  # 'cool', 'optical_flow'
         linewidth: int = 2,
-        show_first_frame: int = 10,
+        show_first_frame: int = 1,
         tracks_leave_trace: int = 0,  # -1 for infinite
     ):
         self.mode = mode
@@ -98,6 +99,7 @@ class Visualizer:
         save_video: bool = True,
         compensate_for_camera_motion: bool = False,
         opacity: float = 1.0,
+        add_numbers_to_frame: bool = True,
     ):
         if compensate_for_camera_motion:
             assert segm_mask is not None
@@ -129,6 +131,8 @@ class Visualizer:
             compensate_for_camera_motion=compensate_for_camera_motion,
             color_alpha=color_alpha,
         )
+        if add_numbers_to_frame:
+            res_video = self.add_frame_numbers(res_video)
         if save_video:
             self.save_video(res_video, filename=filename, writer=writer, step=step)
         return res_video
@@ -150,10 +154,12 @@ class Visualizer:
             save_path = os.path.join(self.save_dir, f"{filename}.mp4")
 
             # Create a writer object
-            video_writer = imageio.get_writer(save_path, fps=self.fps)
+            video_writer = imageio.get_writer(
+                save_path, fps=self.fps, macro_block_size=1
+            )
 
             # Write frames to the video file
-            for frame in wide_list[2:-1]:
+            for frame in wide_list:
                 video_writer.append_data(frame)
 
             video_writer.close()
@@ -361,3 +367,15 @@ class Visualizer:
                     )
         rgb = np.array(rgb)
         return rgb
+
+    def add_frame_numbers(self, video):
+        B, T, C, H, W = video.shape
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        video = video[0].permute(0, 2, 3, 1).byte().detach().cpu().numpy()  # T, H, W, C
+        framed_video = []
+        for i, frame in enumerate(video):
+            frame = cv2.putText(
+                frame, f"Frame: {i}", (10, H - 10), font, 0.5, (255, 255, 255)
+            )
+            framed_video.append(frame)
+        return torch.from_numpy(np.stack(framed_video)).permute(0, 3, 1, 2)[None]

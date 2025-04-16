@@ -1,5 +1,6 @@
 import os
 from textwrap import wrap
+from warnings import warn
 
 import cv2
 import numpy as np
@@ -10,15 +11,18 @@ from matplotlib import colormaps as cm
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.collections import PathCollection
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 from numpy import typing as npt
 from scipy.spatial.transform import Rotation as R
 from sips.data import CameraPose
+from torch import nn
 
 from cotracker.utils.config import Config
 from cotracker.utils.io import IO
+from cotracker.utils.visualizer import read_video_from_path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
     "expandable_segments:True"  # makes tracking of larger videos possible as it avoids fragsmentation
@@ -30,8 +34,8 @@ class Odometry:
         self.config = config
         self.io = IO(config)
 
-        self.true_keypoints = self.get_true_keypoints()  # (num_frames, num_tracks, 2)
         self.source_video = self.get_source_video()  # (num_frames, H, W, C)
+        self.true_keypoints = self.get_true_keypoints()  # (num_frames, num_tracks, 2)
 
         self.pred_keypoints: npt.NDArray[np.float64] = np.array(
             []
@@ -50,6 +54,8 @@ class Odometry:
         )  # (B, num_frames - 1, num_tracks)
 
         self.colormap = cm["cool"]
+
+        self.show_all = self.config.plot_all_datapoints
 
     # --------------------------------------------------------------------------
     # Load or generate "true" keypoints and the source video
@@ -114,6 +120,7 @@ class Odometry:
                     continue
             return true_keypoints
 
+        return self.get_automatic_keypoints()
         # Get manually selected keypoints for real data
         manual_keypoints = self.config.manual_keypoints.get(self.config.file_name, None)
         if manual_keypoints is None:
@@ -130,6 +137,35 @@ class Odometry:
             ),
         ] = manual_keypoints[:, 1:]
         return true_keypoints
+
+    def get_automatic_keypoints(self, model_step: int = 8) -> npt.NDArray[np.float64]:
+        warn("Keypoints just overwritten with the automatic model")
+        _, W = self.config.image_shape
+        maxpool = nn.MaxPool2d(kernel_size=8, stride=8, return_indices=True)
+        true_keypoints = torch.empty(1, 0, 3)
+        for idx in range(
+            0,
+            self.source_video.shape[0] - 2 * model_step,
+            2 * model_step,
+        ):
+            pool, index = maxpool(
+                torch.from_numpy(self.source_video[idx][..., 0][None])
+            )
+            mask = pool > self.config.brightness_threshold
+            if mask.sum() < 2:
+                warn(
+                    f"Less then 2 keypoints found in iteration {idx}, please check the brightness threshold"
+                )  # TODO: change to Error as this is a requirement for odometry
+            index = index[mask]
+            pool = pool[mask]
+            coords = torch.stack(
+                (torch.full((len(index),), idx), index % W, index // W), dim=1
+            )
+            true_keypoints = torch.cat(
+                (true_keypoints, coords[None]), dim=1
+            )
+        self.config.num_tracks = true_keypoints.shape[1]
+        return self._keypoints_from_cotrack_format(true_keypoints.numpy())
 
     def get_source_video(self) -> npt.NDArray[np.uint8]:
         source_video_path = self.io.get_source_video_path()
@@ -281,34 +317,41 @@ class Odometry:
         assert true_keypoints.shape == (1, self.config.num_tracks, 3)
         return true_keypoints
 
+    def _keypoints_from_cotrack_format(
+        self, keypoints: npt.NDArray
+    ) -> npt.NDArray[np.float64]:
+        assert (
+            keypoints.ndim == 3 and keypoints.shape[2] == 3 and keypoints.shape[0] == 1
+        )
+        _, T, _ = keypoints.shape
+
+        true_keypoints = np.full((self.config.num_frames, T, 2), np.nan)
+        true_keypoints[
+            keypoints[..., 0][0].astype(int), np.linspace(0, T - 1, T, dtype=int)
+        ] = keypoints[0, :, 1:]
+        return true_keypoints
+
     def _compute_cotrack_keypoints(self) -> None:
         default_device = self.config.default_device
         if default_device == "cuda":
             torch.cuda.empty_cache()
-        source_video = (
-            torch.from_numpy(self.source_video).permute(0, 3, 1, 2)[None].float()
-        ).to(default_device)  # (B, num_frames, 3, H, W)
+        source_video = torch.from_numpy(self.source_video).permute(0, 3, 1, 2)[
+            None
+        ]  # (B, num_frames, 3, H, W)
         if self.config.offline_model:
-            model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
+            model = torch.hub.load(
+                "facebookresearch/co-tracker", "cotracker3_offline"
+            ).to(default_device)
         else:
-            model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online")
-        model = model.to(default_device)
+            model = torch.hub.load(
+                "facebookresearch/co-tracker", "cotracker3_online"
+            ).to(default_device)
 
         true_keypoints = torch.Tensor(self.true_keypoints).to(default_device)
-        # The cotracker model expects the queries to have shape (B, num_tracks, 2)
-        # with the batch number B being 1 for our case and the last dimension consisting
-        # of the frame number and the x and y coordinates of the keypoints.
-
         true_keypoints = self._keypoints_to_cotrack_format(true_keypoints)
-        # true_keypoints = true_keypoints[0][None]
-        # true_keypoints = torch.cat(
-        #     (
-        #         torch.zeros(1, true_keypoints.shape[1], 1).to(default_device),
-        #         true_keypoints,
-        #     ),
-        #     dim=2,
-        # )
 
+        true_keypoints = true_keypoints.to(default_device)
+        self.config.num_tracks = true_keypoints.shape[1]
         assert (
             true_keypoints.ndim == 3
             and true_keypoints.shape[2] == 3
@@ -317,21 +360,31 @@ class Odometry:
 
         if self.config.offline_model:
             pred_keypoints, pred_visibilities = model(
-                source_video,
+                source_video.to(default_device).float(),
                 queries=true_keypoints,
                 # grid_size=10,
                 backward_tracking=self.config.offline_model_backward_tracking,
             )
         else:
-            model(
-                video_chunk=source_video,
-                is_first_step=True,
-                queries=true_keypoints,
-            )
+            # Only the height and width dimension is necessary for the first_step
+            # removes the need to have the whole video in gpu memory
+            init_dummy_video = torch.zeros((1, 1, 1, *source_video.shape[-2:]))
 
-            for ind in range(0, source_video.shape[1] - model.step, model.step):
+            model(
+                video_chunk=init_dummy_video,
+                is_first_step=True,
+                queries=None,
+            )
+            for idx in range(0, source_video.shape[1] - model.step, model.step):
+                query_idx = idx if idx == 0 else idx + model.step
+                current_queries = true_keypoints[
+                    :, torch.where(true_keypoints[..., 0] == query_idx)[1]
+                ].clone()
                 pred_keypoints, pred_visibilities = model(
-                    video_chunk=source_video[:, ind : ind + model.step * 2]
+                    video_chunk=source_video[:, idx : idx + model.step * 2]
+                    .to(default_device)
+                    .float(),
+                    queries=None if current_queries.numel() == 0 else current_queries,
                 )  # (B, num_frames, num_tracks, 2), (1, num_frames, num_tracks)
         self.pred_keypoints = pred_keypoints.cpu().numpy()[0]
         self.pred_visibilities = pred_visibilities.cpu().numpy()[0]
@@ -383,7 +436,7 @@ class Odometry:
 
         print("Finished keypoint tracking")
         if self.config.compare_cotracker_models:
-            _compare_models()
+            self._compare_models()
         return
 
     # --------------------------------------------------------------------------
@@ -449,9 +502,10 @@ class Odometry:
     ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.uint8]]:
         src_centered = src
         dst_centered = dst
+        _, W = self.config.image_shape
 
-        src_centered[:, 0] = src_centered[:, 0] - (1116 // 2)
-        dst_centered[:, 0] = dst_centered[:, 0] - (1116 // 2)
+        src_centered[:, 0] = src_centered[:, 0] - (W // 2)
+        dst_centered[:, 0] = dst_centered[:, 0] - (W // 2)
         T, inl = cv2.estimateAffinePartial2D(
             src_centered,
             dst_centered,
@@ -726,7 +780,7 @@ class Odometry:
 
     def plot_odometry_transformations(
         self, meters: bool = True, degrees: bool = True
-    ) -> tuple[Axes, Axes]:
+    ) -> list[Axes]:
         if self.odometry_transforms.shape[0] == 2:
             _, true_ax = plt.subplots()
         else:
@@ -736,7 +790,7 @@ class Odometry:
 
         # Get colors
         colors = self.colormap(np.linspace(0, 1, 3))
-
+        axes = []
         for ax, transforms, name in zip(
             [pred_ax, true_ax],
             [*self.odometry_transforms],
@@ -745,10 +799,12 @@ class Odometry:
             assert transforms.ndim == 3
             if ax is None:
                 continue
+            if not self.show_all:
+                transforms = transforms[: self.last_existing_transform]
             # Make sure that both potential plots have the same x-axis limits
             # to make the comparison easier. The offsets are chosen based on
             # default offsets of matplotlib.
-            ax.set_xlim(-0.65, self.odometry_transforms.shape[1] - 0.35)
+            ax.set_xlim(-0.65, transforms.shape[0] - 0.35)
             xs = [self._xs(transform, meters=meters) for transform in transforms]
             xs_lns = ax.plot(
                 xs,
@@ -767,8 +823,9 @@ class Odometry:
             )
 
             ax_twin = ax.twinx()
+            yaws = self._yaws(transforms, degrees=degrees)
             yaws_lns = ax_twin.plot(
-                self._yaws(transforms, degrees=degrees),
+                yaws,
                 marker=".",
                 linestyle="-",
                 label="yaws",
@@ -797,7 +854,11 @@ class Odometry:
                     )
                 )
             )
-        return true_ax, pred_ax
+            self.xs_pred = xs
+            self.ys_pred = ys
+            self.yaws_pred = yaws
+            axes.append(ax)
+        return axes
 
     def calculate_poses_from_transforms(
         self,
@@ -827,8 +888,9 @@ class Odometry:
                 old_pos[1].item() + y_offset,
                 old_pos[2].item(),
             ]
+            tracker.move(surge=-y_offset, sway=-x_offset, yaw=transform_yaw)
 
-            tracker.move_abs(CameraPose(updated_pos, updated_quat))
+            warn("Wrong assignment of x and y offsets")
         return
 
     def _get_init_pose(self) -> CameraPose:
@@ -851,11 +913,14 @@ class Odometry:
                 transforms, pose_tracker, meters=meters
             )
             poses_ax = plot_camera_poses(pose_tracker, show=False, color=colors)
+            poses_ax.view_init(elev=90, azim=90)
+
             poses_ax.scatter(
                 pose_tracker[0][0].position[0],
                 pose_tracker[0][0].position[1],
                 pose_tracker[0][0].position[2],
-                color="lime",
+                facecolor="white",
+                edgecolor="black",
                 label="Origin",
             )
             poses_ax.set_ylabel("y [meters]" if meters else "y [pixels]")
@@ -883,7 +948,166 @@ class Odometry:
                     )
                 )
             )
+
+            for i in range(25, len(pose_tracker), 25):
+                poses_ax.text(*pose_tracker[i][0].position, str(i))
         return axes
+
+    def plot_true_transformations(
+        self, meters: bool = True, degrees: bool = True
+    ) -> Axes:
+        _, ax = plt.subplots()
+
+        # Get colors
+        colors = self.colormap(np.linspace(0, 1, 3))
+
+        true_poses = self.io.load_true_poses()
+        if not self.show_all:
+            true_poses = true_poses[: self.last_existing_transform]
+
+        ax.set_xlim(-0.65, len(true_poses) - 0.35)
+
+        x_pos = [pose["position"][0] for pose in true_poses]
+        xs = np.diff(x_pos)
+        xs_lns = ax.plot(
+            xs,
+            label="xs",
+            marker=".",
+            linestyle="-.",
+            c=colors[0],
+        )
+
+        y_pos = [pose["position"][1] for pose in true_poses]
+        ys = np.diff(y_pos)
+        ys_lns = ax.plot(
+            ys,
+            label="ys",
+            marker=".",
+            linestyle="--",
+            c=colors[1],
+        )
+
+        ax_twin = ax.twinx()
+        yaw_rots = [
+            R.from_quat(pose["orientation"]).as_rotvec()[2] for pose in true_poses
+        ]
+        yaws = np.diff(yaw_rots)
+        yaws_lns = ax_twin.plot(
+            yaws,
+            marker=".",
+            linestyle="-",
+            label="yaws",
+            c=colors[2],
+        )
+
+        ax_twin.get_yaxis().get_major_formatter().set_useOffset(False)
+        lns = xs_lns + ys_lns + yaws_lns
+        labs = [line.get_label() for line in lns]
+        ax.legend(lns, labs)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, prune="both"))
+        translation_ylabel = (
+            "Translation [meters]" if meters else "Translation [pixels]"
+        )
+        ax.set_ylabel(translation_ylabel)
+        rotation_ylabel = "Yaw [radians]" if not degrees else "Yaw [degrees]"
+        ax_twin.set_ylabel(rotation_ylabel, color=colors[2])
+        ax_twin.tick_params(axis="y", labelcolor=colors[2])
+        ax.set_title(
+            "\n".join(
+                wrap(
+                    "True (recorded) transformations",
+                    60,
+                )
+            )
+        )
+        self.xs_true = xs
+        self.ys_true = ys
+        self.yaws_true = yaws
+        return ax
+
+    def plot_true_poses(self, meters: bool = True) -> Axes3D:
+        custom_cm = cm["gist_rainbow"]
+        colors = custom_cm(np.linspace(0, 1, self.odometry_transforms.shape[1] + 1))
+
+        true_poses = self.io.load_true_poses()
+        tracker = CameraPoseTracker(
+            CameraPose(true_poses[0]["position"], true_poses[0]["orientation"])
+        )
+        if not self.show_all:
+            true_poses = true_poses[: self.last_existing_transform]
+        for pose in list(true_poses)[1:]:
+            tracker.move_abs(CameraPose(pose["position"], pose["orientation"]))
+
+        true_poses_ax = plot_camera_poses(tracker, color=colors, show=False)
+        true_poses_ax.view_init(elev=90, azim=90)
+        true_poses_ax.scatter(
+            tracker[0][0].position[0],
+            tracker[0][0].position[1],
+            tracker[0][0].position[2],
+            facecolor="white",
+            edgecolor="black",
+            label="Origin",
+        )
+
+        true_poses_ax.set_ylabel("y [meters]" if meters else "y [pixels]")
+        true_poses_ax.set_xlabel("x [meters]" if meters else "x [pixels]")
+        true_poses_ax.set_zlabel("z [meters]" if meters else "z [pixels]")
+        # Connect subsequent poses with lines
+        for i in range(len(tracker) - 1):
+            positions = np.vstack((tracker[i][0].position, tracker[i + 1][0].position))
+            true_poses_ax.plot(
+                *positions.T,
+                color="black",
+                alpha=0.5,
+                label="Trajectory" if i == 0 else "",
+            )
+        true_poses_ax.legend()
+        distance_unit = "meters" if meters else "pixels"
+        true_poses_ax.set_title(
+            "\n".join(
+                wrap(
+                    f"True (interpolated) pose trajectory of {len(tracker)} recorded poses in {distance_unit} ",
+                    60,
+                )
+            )
+        )
+        for i in range(25, len(tracker), 25):
+            true_poses_ax.text(*tracker[i][0].position, str(i))
+        return true_poses_ax
+
+    def plot_transformations(self) -> Figure:
+        fig, axes = plt.subplots(3)
+
+        attributes = [
+            ("xs_true", axes[0], "x true"),
+            ("xs_pred", axes[0], "x pred"),
+            ("ys_true", axes[1], "y true"),
+            ("ys_pred", axes[1], "y pred"),
+            ("yaws_true", axes[2], "yaw true"),
+            ("yaws_pred", axes[2], "yaw pred"),
+        ]
+
+        for attr, ax, label in attributes:
+            if hasattr(self, attr):
+                ax.plot(getattr(self, attr), label=label)
+        axes[0].plot(
+            -np.array(self.ys_pred), label="minus y pred", alpha=0.5, linestyle="--"
+        )
+        axes[1].plot(
+            -np.array(self.xs_pred), label="minus y pred", alpha=0.5, linestyle="--"
+        )
+        for ax in axes:
+            ax.hlines(
+                y=0,
+                xmin=-1,
+                xmax=len(self.xs_true),
+                linestyles="dashed",
+                colors="black",
+                alpha=0.5,
+            )
+            ax.legend()
+        fig.suptitle("Comparison of true and predicted transformations")
+        return fig
 
     def analyze_odometry(self) -> None:
         if len(self.pred_keypoints) == 0:
@@ -900,16 +1124,39 @@ class Odometry:
             except FileNotFoundError:
                 self.estimate_odometry()
 
-        _ = self.plot_keypoint_trajectories()
-        _ = self.plot_odometry_transformations()
-        _ = self.plot_odometry_estimated_poses()
-
+        self.last_existing_transform = (
+            (
+                np.where(np.isnan(self.odometry_transforms[0]).all(axis=(1, 2)))[
+                    0
+                ].min()
+                + 1
+            )
+            if np.isnan(self.odometry_transforms[0]).all(axis=(1, 2)).any()
+            else self.config.num_frames
+        )
+        # kp_trajectories_ax = self.plot_keypoint_trajectories()
+        odo_transformations_ax = self.plot_odometry_transformations()
+        odo_poses_ax = self.plot_odometry_estimated_poses()
+        true_transformations_ax = self.plot_true_transformations()
+        true_poses_ax = self.plot_true_poses()
+        transformations_fig = self.plot_transformations()
+        axes = [
+            # kp_trajectories_ax,
+            *odo_transformations_ax,
+            *odo_poses_ax,
+            true_transformations_ax,
+            true_poses_ax,
+            transformations_fig,
+        ]
         plt.show()
         return
 
     def save_data(self) -> None:
+        print("Saving data")
         self.io.store_keypoints(self.true_keypoints, pred=False)
-        self.io.store_synthetic_video(self.source_video)
+
+        if self.config.synthetic_data:
+            self.io.store_synthetic_video(self.source_video)
 
         # cotrack_keypoints() has been called
         if len(self.pred_keypoints) > 0:

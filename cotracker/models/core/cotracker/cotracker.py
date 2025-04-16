@@ -8,20 +8,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cotracker.models.core.model_utils import sample_features4d, sample_features5d
+from cotracker.models.core.cotracker.blocks import (
+    Attention,
+    AttnBlock,
+    BasicEncoder,
+    CorrBlock,
+    Mlp,
+)
 from cotracker.models.core.embeddings import (
-    get_2d_embedding,
     get_1d_sincos_pos_embed_from_grid,
+    get_2d_embedding,
     get_2d_sincos_pos_embed,
 )
-
-from cotracker.models.core.cotracker.blocks import (
-    Mlp,
-    BasicEncoder,
-    AttnBlock,
-    CorrBlock,
-    Attention,
-)
+from cotracker.models.core.model_utils import sample_features4d, sample_features5d
 
 torch.manual_seed(0)
 
@@ -230,9 +229,9 @@ class CoTracker2(nn.Module):
         assert S >= 2  # A tracker needs at least two frames to track something
         if is_online:
             assert T <= S, "Online mode: video chunk must be <= window size."
-            assert (
-                self.online_ind is not None
-            ), "Call model.init_video_online_processing() first."
+            assert self.online_ind is not None, (
+                "Call model.init_video_online_processing() first."
+            )
             assert not is_train, "Training not supported in online mode."
         step = S // 2  # How much the sliding window moves at every step
         video = 2 * (video / 255.0) - 1.0
@@ -543,7 +542,7 @@ class CrossAttnBlock(nn.Module):
             context_dim=context_dim,
             num_heads=num_heads,
             qkv_bias=True,
-            **block_kwargs
+            **block_kwargs,
         )
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
