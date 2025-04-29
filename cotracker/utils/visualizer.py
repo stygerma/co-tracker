@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from matplotlib import cm
 from PIL import Image, ImageDraw
+from tqdm import tqdm, trange
 
 
 def read_video_from_path(path):
@@ -159,7 +160,9 @@ class Visualizer:
             )
 
             # Write frames to the video file
-            for frame in wide_list:
+            for frame in wide_list[
+                2:-1
+            ]:  # Skip the first and last frames as the sliding window does not cover them twice
                 video_writer.append_data(frame)
 
             video_writer.close()
@@ -183,7 +186,9 @@ class Visualizer:
         assert D == 2
         assert C == 3
         video = video[0].permute(0, 2, 3, 1).byte().detach().cpu().numpy()  # S, H, W, C
-        tracks = tracks[0].long().detach().cpu().numpy()  # S, N, 2
+        tracks = tracks[0].detach().cpu().numpy()  # S, N, 2
+        # Make quasi-integers
+        tracks = tracks // 1
         if gt_tracks is not None:
             gt_tracks = gt_tracks[0].detach().cpu().numpy()
 
@@ -201,16 +206,18 @@ class Visualizer:
         elif segm_mask is None:
             if self.mode == "rainbow":
                 y_min, y_max = (
-                    tracks[query_frame, :, 1].min(),
-                    tracks[query_frame, :, 1].max(),
+                    np.nanmin(tracks[:, :, 1]),
+                    np.nanmax(tracks[:, :, 1]),
                 )
                 norm = plt.Normalize(y_min, y_max)
                 for n in range(N):
-                    if isinstance(query_frame, torch.Tensor):
-                        query_frame_ = query_frame[n]
-                    else:
-                        query_frame_ = query_frame
-                    color = self.color_map(norm(tracks[query_frame_, n, 1]))
+                    first_non_nan_frame = (
+                        np.logical_or(tracks[:, n] == 0, np.isnan(tracks[:, n]))
+                        .any(axis=-1)
+                        .argmin()
+                    )
+
+                    color = self.color_map(norm(tracks[first_non_nan_frame, n, 1]))
                     color = np.array(color[:3])[None] * 255
                     vector_colors[:, n] = np.repeat(color, T, axis=0)
             else:
@@ -243,7 +250,7 @@ class Visualizer:
 
         #  draw tracks
         if self.tracks_leave_trace != 0:
-            for t in range(query_frame + 1, T):
+            for t in trange(query_frame + 1, T, desc="Drawing tracks"):
                 first_ind = (
                     max(0, t - self.tracks_leave_trace)
                     if self.tracks_leave_trace >= 0
@@ -272,7 +279,7 @@ class Visualizer:
                     )
 
         #  draw points
-        for t in range(T):
+        for t in trange(T, desc="Drawing points"):
             img = Image.fromarray(np.uint8(res_video[t]))
             for i in range(N):
                 coord = (tracks[t, i, 0], tracks[t, i, 1])
@@ -312,6 +319,8 @@ class Visualizer:
             original = rgb.copy()
             alpha = (s / T) ** 2
             for i in range(N):
+                if np.isnan(tracks[s : s + 2, i, :]).any():
+                    continue
                 coord_y = (int(tracks[s, i, 0]), int(tracks[s, i, 1]))
                 coord_x = (int(tracks[s + 1, i, 0]), int(tracks[s + 1, i, 1]))
                 if coord_y[0] != 0 and coord_y[1] != 0:
@@ -373,7 +382,7 @@ class Visualizer:
         font = cv2.FONT_HERSHEY_SIMPLEX
         video = video[0].permute(0, 2, 3, 1).byte().detach().cpu().numpy()  # T, H, W, C
         framed_video = []
-        for i, frame in enumerate(video):
+        for i, frame in tqdm(enumerate(video), desc="Add frame numbers"):
             frame = cv2.putText(
                 frame, f"Frame: {i}", (10, H - 10), font, 0.5, (255, 255, 255)
             )

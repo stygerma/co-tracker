@@ -207,13 +207,14 @@ class IO:
         video: npt.NDArray[np.uint8],
         pred_keypoints: npt.NDArray[np.float64],
         pred_visibilities: npt.NDArray[np.bool_],
+        tracks_leave_trace: int = -1,
     ) -> None:
         vis = Visualizer(
             save_dir=str(self.get_saved_video_dir()),
             # pad_value=120,
             linewidth=3,
             fps=5,
-            tracks_leave_trace=-1,
+            tracks_leave_trace=tracks_leave_trace,
         )
         vis.visualize(
             torch.tensor(video).permute(0, 3, 1, 2).unsqueeze(0),

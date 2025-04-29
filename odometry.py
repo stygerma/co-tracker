@@ -5,6 +5,7 @@ from warnings import warn
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from drone_movements._data import CameraPoseTracker
 from drone_movements._plotting import plot_camera_poses
 from matplotlib import colormaps as cm
@@ -19,6 +20,7 @@ from numpy import typing as npt
 from scipy.spatial.transform import Rotation as R
 from sips.data import CameraPose
 from torch import nn
+from tqdm import trange
 
 from cotracker.utils.config import Config
 from cotracker.utils.io import IO
@@ -161,9 +163,7 @@ class Odometry:
             coords = torch.stack(
                 (torch.full((len(index),), idx), index % W, index // W), dim=1
             )
-            true_keypoints = torch.cat(
-                (true_keypoints, coords[None]), dim=1
-            )
+            true_keypoints = torch.cat((true_keypoints, coords[None]), dim=1)
         self.config.num_tracks = true_keypoints.shape[1]
         return self._keypoints_from_cotrack_format(true_keypoints.numpy())
 
@@ -350,7 +350,7 @@ class Odometry:
         true_keypoints = torch.Tensor(self.true_keypoints).to(default_device)
         true_keypoints = self._keypoints_to_cotrack_format(true_keypoints)
 
-        true_keypoints = true_keypoints.to(default_device)
+        true_keypoints = true_keypoints
         self.config.num_tracks = true_keypoints.shape[1]
         assert (
             true_keypoints.ndim == 3
@@ -361,7 +361,7 @@ class Odometry:
         if self.config.offline_model:
             pred_keypoints, pred_visibilities = model(
                 source_video.to(default_device).float(),
-                queries=true_keypoints,
+                queries=true_keypoints.to(default_device),
                 # grid_size=10,
                 backward_tracking=self.config.offline_model_backward_tracking,
             )
@@ -375,19 +375,91 @@ class Odometry:
                 is_first_step=True,
                 queries=None,
             )
-            for idx in range(0, source_video.shape[1] - model.step, model.step):
-                query_idx = idx if idx == 0 else idx + model.step
-                current_queries = true_keypoints[
-                    :, torch.where(true_keypoints[..., 0] == query_idx)[1]
-                ].clone()
-                pred_keypoints, pred_visibilities = model(
-                    video_chunk=source_video[:, idx : idx + model.step * 2]
+            storage_pred_keypoints = torch.full((8, 1, 2), torch.nan, device="cpu")
+            storage_pred_visibilities = torch.full(
+                (8, 1), False, dtype=torch.bool, device="cpu"
+            )
+            times = []
+            for frame_idx in trange(
+                0,
+                source_video.shape[1] - model.step,
+                model.step,
+                desc="Co-tracker predictions",
+            ):
+                query_idx = frame_idx if frame_idx == 0 else frame_idx + model.step
+                current_queries = (
+                    true_keypoints[
+                        :, torch.where(true_keypoints[..., 0] == query_idx)[1]
+                    ]
+                    .to(default_device)
+                    .clone()
+                )
+
+                # Pad the track dimension by the number of new queries
+                # Pad the frame dimension by 8
+                track_pad = (
+                    current_queries.shape[1] if current_queries.numel() > 0 else 0
+                )
+                # 8 is the default padding as 8 new frames are added. For the end of the video
+                # the padding is reduced to avoid padding beyond last frame
+                frame_pad = min(8, source_video.shape[1] - frame_idx - 8)
+                if frame_idx == 0:
+                    track_pad -= 1
+                storage_pred_keypoints = F.pad(
+                    storage_pred_keypoints,
+                    (0, 0, 0, track_pad, 0, frame_pad),
+                    "constant",
+                    torch.nan,
+                )
+                storage_pred_visibilities = F.pad(
+                    storage_pred_visibilities,
+                    (0, track_pad, 0, frame_pad),
+                    "constant",
+                    False,
+                )
+                num_frames, num_tracks, _ = storage_pred_keypoints.shape
+
+                if frame_idx == 0:
+                    current_indices = torch.linspace(
+                        0,
+                        num_tracks - 1,
+                        num_tracks,
+                        device="cpu",
+                    )
+                else:
+                    if track_pad > 0:
+                        # Add the indices of the new queries to the current indices
+                        current_indices = torch.cat(
+                            [
+                                current_indices,
+                                torch.linspace(0, num_tracks - 1, num_tracks)[
+                                    -track_pad:
+                                ],
+                            ]
+                        )
+
+                pred_keypoints, pred_visibilities, remaining_indices = model(
+                    video_chunk=source_video[:, frame_idx : frame_idx + model.step * 2]
                     .to(default_device)
                     .float(),
                     queries=None if current_queries.numel() == 0 else current_queries,
                 )  # (B, num_frames, num_tracks, 2), (1, num_frames, num_tracks)
-        self.pred_keypoints = pred_keypoints.cpu().numpy()[0]
-        self.pred_visibilities = pred_visibilities.cpu().numpy()[0]
+
+                mask = torch.zeros(num_tracks, dtype=bool)
+                mask[current_indices.int()] = True
+                mask = mask.unsqueeze(-1)
+                storage_pred_visibilities[:, mask[:, 0]] = (
+                    pred_visibilities[0].view(num_frames, -1).cpu()
+                )
+                mask = torch.cat([mask, mask], dim=-1).view(-1, 2)
+                storage_pred_keypoints[
+                    :,
+                    mask,
+                ] = pred_keypoints[0].view(num_frames, -1).cpu()
+
+                current_indices = remaining_indices.cpu()
+        self.pred_keypoints = storage_pred_keypoints.numpy()
+        self.pred_visibilities = storage_pred_visibilities.numpy()
         if default_device == "cuda":
             torch.cuda.empty_cache()
 
@@ -500,8 +572,11 @@ class Odometry:
     def _calculate_transform(
         self, src: npt.NDArray[np.float64], dst: npt.NDArray[np.float64]
     ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.uint8]]:
-        src_centered = src
-        dst_centered = dst
+        mask = np.logical_or(~np.isnan(src), ~np.isnan(dst))
+        assert (mask[..., 0] == mask[..., 1]).all()
+        inliers = np.full((mask.shape[0], 1), 0)
+        src_centered = src.copy()[mask].reshape(-1, 2)
+        dst_centered = dst.copy()[mask].reshape(-1, 2)
         _, W = self.config.image_shape
 
         src_centered[:, 0] = src_centered[:, 0] - (W // 2)
@@ -512,9 +587,10 @@ class Odometry:
             method=cv2.RANSAC,
             ransacReprojThreshold=5,
         )
+        inliers[mask[:, 0]] = inl
         if T is None:
             T = np.full((2, 3), np.nan)
-        return T.astype(np.float64), inl.astype(np.uint8).squeeze()
+        return T.astype(np.float64), inliers.astype(np.uint8).squeeze()
 
     # --------------------------------------------------------------------------
     # Odometry analysis with plots and metrics
@@ -1163,7 +1239,10 @@ class Odometry:
             self.io.store_keypoints(self.pred_keypoints, pred=True)
             self.io.store_visibilities(self.pred_visibilities)
             self.io.store_cotracker_video(
-                self.source_video, self.pred_keypoints, self.pred_visibilities
+                self.source_video,
+                self.pred_keypoints,
+                self.pred_visibilities,
+                tracks_leave_trace=16,
             )
 
         # analyze_odometry() has been called

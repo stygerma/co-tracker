@@ -279,8 +279,31 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
             )
 
             if not hasattr(self, "queries") or self.queries is None:
+                # Add track indices to the queries for tracking purposes
+                queries = torch.cat(
+                    [
+                        torch.linspace(0, queries.shape[1] - 1, queries.shape[1])[
+                            None, :, None
+                        ].to(queries.device),
+                        queries,
+                    ],
+                    dim=2,
+                )
                 self.queries = queries
             else:
+                # Add track indices to the queries for tracking purposes
+                prev_highest_idx = self.queries[0, -1, 0].int().item()
+                queries = torch.cat(
+                    [
+                        torch.linspace(
+                            prev_highest_idx + 1,
+                            prev_highest_idx + queries.shape[1],
+                            queries.shape[1],
+                        )[None, :, None].to(queries.device),
+                        queries,
+                    ],
+                    dim=2,
+                )
                 self.queries = torch.cat([self.queries, queries], dim=1)
 
         video_chunk = video_chunk.reshape(B * T, C, H, W)
@@ -295,9 +318,13 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 video=video_chunk, queries=self.queries, iters=6, is_online=True
             )
         else:
-            tracks, visibilities, confidence, __ = self.model(
+            tracks, visibilities, confidence, remaining_indices, __ = self.model(
                 video=video_chunk, queries=self.queries, iters=6, is_online=True
             )
+            # Remove the queries that are no longer tracked
+            self.queries = self.queries[
+                (remaining_indices == self.queries[..., 0][..., None]).any(dim=2)
+            ].view(B, -1, 4)
         if add_support_grid:
             tracks = tracks[:, :, : self.N]
             visibilities = visibilities[:, :, : self.N]
@@ -315,4 +342,5 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 ]
             ),
             visibilities > thr,
+            remaining_indices,
         )

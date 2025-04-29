@@ -516,24 +516,22 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
             attention_mask = (queried_frames < ind + S).reshape(B, 1, N)  # B S N
             if (coords_init <= 0.0).any():
                 print("Bad coords_init")
-            coords, viss, confs = (
-                self.forward_window(
-                    fmaps_pyramid=(
-                        fmaps_pyramid
-                        if is_online
-                        else [fmap[:, ind : ind + S] for fmap in fmaps_pyramid]
-                    ),
-                    coords=coords_init,
-                    track_feat_support_pyramid=[
-                        attention_mask[:, None, :, :, None] * tfeat
-                        for tfeat in track_feat_support_pyramid
-                    ],
-                    vis=vis_init,
-                    conf=conf_init,
-                    attention_mask=attention_mask.repeat(1, S, 1),
-                    iters=iters,
-                    add_space_attn=add_space_attn,
-                )
+            coords, viss, confs = self.forward_window(
+                fmaps_pyramid=(
+                    fmaps_pyramid
+                    if is_online
+                    else [fmap[:, ind : ind + S] for fmap in fmaps_pyramid]
+                ),
+                coords=coords_init,
+                track_feat_support_pyramid=[
+                    attention_mask[:, None, :, :, None] * tfeat
+                    for tfeat in track_feat_support_pyramid
+                ],
+                vis=vis_init,
+                conf=conf_init,
+                attention_mask=attention_mask.repeat(1, S, 1),
+                iters=iters,
+                add_space_attn=add_space_attn,
             )
             S_trimmed = (
                 T if is_online else min(T - ind, S)
